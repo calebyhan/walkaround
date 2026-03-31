@@ -27,6 +27,8 @@ chrome-user-data
 /.worktrees
 .claude/*.local.*
 CLAUDE.md
+.env.local
+dist/*
 
 packages/react-devtools-core/dist
 packages/react-devtools-extensions/chrome/build
