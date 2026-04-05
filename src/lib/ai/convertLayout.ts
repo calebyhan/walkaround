@@ -29,6 +29,12 @@ export interface AIRoomDraft {
   id: string
   name: string
   image_bbox: ImageBBox
+  /**
+   * Room polygon in metre coordinates (y-up, origin bottom-left).
+   * Populated by the CV-assisted path from the BFS polygon.
+   * When present, used instead of image_bbox for room vertices and wall edges.
+   */
+  polygon_m?: Point[]
   floor_material: string
   ceiling_height: number
   confidence: 'high' | 'medium' | 'low'
@@ -97,23 +103,79 @@ interface RoomEdge {
   ceilingHeight: number
 }
 
+/**
+ * Compute room edges for wall generation.
+ *
+ * When polygon_m is present (CV-assisted path): derive edges from all polygon
+ * segments. Supports non-rectangular rooms (L-shaped, T-shaped, etc.).
+ *
+ * Fallback (LLM-only path): derive four axis-aligned edges from image_bbox.
+ *
+ * Direction (north/south/east/west) is inferred from each edge's outward normal
+ * relative to the polygon winding. The polygon from the CV path is CW in pixel
+ * space (y-down). The Y-flip (y_m = totalH - y_px) reverses the winding order,
+ * so the polygon is CCW in metre space (y-up). For a CCW polygon in y-up space
+ * the outward normal of edge P0→P1 with d=(dx,dy) is (dy, -dx):
+ *   - horizontal edge going right (dx>0): normal y = -dx < 0 → south (bottom wall)
+ *   - horizontal edge going left  (dx<0): normal y = -dx > 0 → north (top wall)
+ *   - vertical edge going up      (dy>0): normal x = dy  > 0 → east  (right wall)
+ *   - vertical edge going down    (dy<0): normal x = dy  < 0 → west  (left wall)
+ */
 function computeRoomEdges(room: AIRoomDraft, totalW: number, totalH: number): RoomEdge[] {
-  const { x0, x1, y0, y1 } = room.image_bbox
-  const xLeft = x0 * totalW
-  const xRight = x1 * totalW
-  const yBottom = (1 - y1) * totalH
-  const yTop = (1 - y0) * totalH
   const h = room.ceiling_height
 
+  if (room.polygon_m && room.polygon_m.length >= 4) {
+    const poly = room.polygon_m
+    const n = poly.length
+    const edges: RoomEdge[] = []
+
+    for (let i = 0; i < n; i++) {
+      const p0 = poly[i]
+      const p1 = poly[(i + 1) % n]
+      const dx = p1.x - p0.x
+      const dy = p1.y - p0.y
+
+      const isHoriz = Math.abs(dy) < EDGE_EPSILON
+      const isVert  = Math.abs(dx) < EDGE_EPSILON
+      if (!isHoriz && !isVert) continue  // skip diagonal edges (shouldn't occur for rectilinear plans)
+
+      let direction: Direction
+      if (isHoriz) {
+        // Polygon is CW in metre space (y-up). Outward normal of P0→P1 is (-dy, dx).
+        // For horizontal edge: normal y = dx → dx>0 means normal points up = north.
+        direction = dx > 0 ? 'north' : 'south'
+        edges.push({
+          roomId: room.id, direction,
+          fixedCoord: p0.y,
+          start: Math.min(p0.x, p1.x), end: Math.max(p0.x, p1.x),
+          ceilingHeight: h,
+        })
+      } else {
+        // For vertical edge: normal x = -dy → dy>0 means normal points left = west.
+        direction = dy > 0 ? 'west' : 'east'
+        edges.push({
+          roomId: room.id, direction,
+          fixedCoord: p0.x,
+          start: Math.min(p0.y, p1.y), end: Math.max(p0.y, p1.y),
+          ceilingHeight: h,
+        })
+      }
+    }
+    return edges
+  }
+
+  // Fallback: rectangular edges from image_bbox
+  const { x0, x1, y0, y1 } = room.image_bbox
+  const xLeft   = x0 * totalW
+  const xRight  = x1 * totalW
+  const yBottom = (1 - y1) * totalH
+  const yTop    = (1 - y0) * totalH
+
   return [
-    // south edge: bottom (y=min), x from left to right
-    { roomId: room.id, direction: 'south', fixedCoord: yBottom, start: xLeft, end: xRight, ceilingHeight: h },
-    // north edge: top (y=max), x from left to right
-    { roomId: room.id, direction: 'north', fixedCoord: yTop, start: xLeft, end: xRight, ceilingHeight: h },
-    // west edge: left (x=min), y from bottom to top
-    { roomId: room.id, direction: 'west', fixedCoord: xLeft, start: yBottom, end: yTop, ceilingHeight: h },
-    // east edge: right (x=max), y from bottom to top
-    { roomId: room.id, direction: 'east', fixedCoord: xRight, start: yBottom, end: yTop, ceilingHeight: h },
+    { roomId: room.id, direction: 'south', fixedCoord: yBottom, start: xLeft,   end: xRight, ceilingHeight: h },
+    { roomId: room.id, direction: 'north', fixedCoord: yTop,    start: xLeft,   end: xRight, ceilingHeight: h },
+    { roomId: room.id, direction: 'west',  fixedCoord: xLeft,   start: yBottom, end: yTop,   ceilingHeight: h },
+    { roomId: room.id, direction: 'east',  fixedCoord: xRight,  start: yBottom, end: yTop,   ceilingHeight: h },
   ]
 }
 
@@ -360,7 +422,9 @@ export function convertDraftToSchema(draft: AILayoutDraft): FloorPlanSchema {
   const rooms: Room[] = draft.rooms.map((r) => ({
     id: r.id,
     name: r.name,
-    vertices: bboxToVertices(r.image_bbox, totalW, totalH),
+    // CV-assisted path: use actual polygon vertices for non-rectangular room support.
+    // LLM-only fallback: derive 4 rectangle corners from image_bbox.
+    vertices: r.polygon_m ?? bboxToVertices(r.image_bbox, totalW, totalH),
     floor_material: r.floor_material,
     ceiling_height: r.ceiling_height,
     confidence: r.confidence,
@@ -889,10 +953,22 @@ export function mergeWithLLMLabels(
       y1: (y + h) / H,
     }
 
+    // Convert the CV polygon from original pixel coordinates to metre coordinates.
+    // Pixel origin: top-left, y downward.  Metre origin: bottom-left, y upward.
+    //   x_m = (x_px / imageWidth)  * totalW
+    //   y_m = (1 - y_px / imageHeight) * totalH
+    const polygon_m: Point[] | undefined = region.originalPolygon.length >= 4
+      ? region.originalPolygon.map((pt) => ({
+          x: (pt.x / W) * totalW,
+          y: (1 - pt.y / H) * totalH,
+        }))
+      : undefined
+
     return {
       id: `room_${region.id}`,
       name: label?.name ?? `Room ${i + 1}`,
       image_bbox,
+      polygon_m,
       floor_material: 'unknown',
       ceiling_height: 2.7,
       confidence: label?.confidence ?? 'low',

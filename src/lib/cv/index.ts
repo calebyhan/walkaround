@@ -34,10 +34,10 @@ export async function runCVPipeline(
   const gray = toGrayscale(dsData)
   const mask = threshold(gray)
 
-  console.log('[walkaround/cv] Running BFS region detection…')
+  console.log('[walkaround/cv] Running BFS flood-fill region detection…')
   const rawRegions = detectRegions(mask, dsW, dsH)
 
-  // Scale bboxes and centroids back to original image coordinates
+  // Scale bboxes, centroids, and polygons back to original image coordinates
   const regions: CVRegion[] = rawRegions.map((r) => ({
     ...r,
     originalBBox: {
@@ -46,13 +46,18 @@ export async function runCVPipeline(
       w: Math.round(r.pixelBBox.w * scale),
       h: Math.round(r.pixelBBox.h * scale),
     },
+    originalPolygon: r.polygon.map((pt) => ({
+      x: Math.round(pt.x * scale),
+      y: Math.round(pt.y * scale),
+    })),
   }))
 
   console.log(`[walkaround/cv] Detected ${regions.length} regions`)
   for (const r of regions) {
     console.log(
       `  [${r.id}] bbox=${r.originalBBox.x},${r.originalBBox.y} ` +
-      `${r.originalBBox.w}×${r.originalBBox.h}px  area=${r.pixelArea}px`,
+      `${r.originalBBox.w}×${r.originalBBox.h}px  area=${r.pixelArea}px  ` +
+      `polygon=${r.originalPolygon.length}pts`,
     )
   }
 

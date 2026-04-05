@@ -6,14 +6,18 @@
  *
  * Gemini's only job: match region numbers to names + dimensions, and list openings.
  * No coordinate estimation. No bounding boxes. Geometry comes from the CV stage.
+ *
+ * The CV detector uses BFS flood-fill with morphological wall-closing, so each
+ * numbered region is a real room polygon (not a grid rectangle). L-shaped and
+ * other non-rectangular rooms appear as a single correctly-shaped polygon.
  */
 export function buildSemanticPrompt(): string {
   return `You are a floor plan label extractor. You will receive TWO images:
 
 IMAGE 1: The original floor plan.
-IMAGE 2: The same floor plan with room regions detected by a computer vision algorithm, each numbered with a white label.
+IMAGE 2: The same floor plan with room regions detected by computer vision. Each region is outlined as a colored polygon and numbered with a white label. The polygons accurately follow room boundaries — a single polygon can be L-shaped, T-shaped, or any other shape to match the real room geometry.
 
-Your task is to match each numbered region to the text labels and dimensions visible in IMAGE 1.
+Your task is to match each numbered polygon region to the text labels and dimensions visible in IMAGE 1.
 
 Return ONLY a JSON object — no markdown, no prose, no code fences.
 

@@ -113,3 +113,66 @@ export function erodeWhite(mask: Uint8Array, width: number, height: number, radi
   }
   return out
 }
+
+/**
+ * Fast separable morphological erosion of white (mask=1) pixels.
+ *
+ * Uses two O(width × height) sliding-window passes (horizontal then vertical)
+ * instead of the naive O(width × height × radius²) approach. The result is
+ * equivalent to a square erosion kernel of size (2*radius+1)² — any white pixel
+ * with a wall neighbour within ±radius on BOTH axes is eroded. This is sufficient
+ * to close door openings in floor-plan images.
+ *
+ * Primary use: close door/window openings before BFS room detection so that
+ * rooms are isolated as separate connected components.
+ */
+export function erodeWhiteFast(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  radius: number,
+): Uint8Array {
+  // --- Horizontal pass ---
+  // For each pixel, count wall neighbours (mask=0) within ±radius columns.
+  // A sliding window of size 2*radius+1 tracks the count.
+  const tmp = new Uint8Array(mask.length)
+  for (let y = 0; y < height; y++) {
+    let wallCount = 0
+    // Initialise window [0, radius]
+    for (let nx = 0; nx <= Math.min(radius, width - 1); nx++) {
+      if (mask[y * width + nx] === 0) wallCount++
+    }
+    for (let x = 0; x < width; x++) {
+      tmp[y * width + x] = wallCount > 0 ? 0 : 1
+
+      // Expand right edge
+      const addX = x + radius + 1
+      if (addX < width && mask[y * width + addX] === 0) wallCount++
+      // Shrink left edge
+      const removeX = x - radius
+      if (removeX >= 0 && mask[y * width + removeX] === 0) wallCount--
+    }
+  }
+
+  // --- Vertical pass (on tmp) ---
+  const out = new Uint8Array(mask.length)
+  for (let x = 0; x < width; x++) {
+    let wallCount = 0
+    // Initialise window [0, radius]
+    for (let ny = 0; ny <= Math.min(radius, height - 1); ny++) {
+      if (tmp[ny * width + x] === 0) wallCount++
+    }
+    for (let y = 0; y < height; y++) {
+      out[y * width + x] = wallCount > 0 ? 0 : 1
+
+      // Expand bottom edge
+      const addY = y + radius + 1
+      if (addY < height && tmp[addY * width + x] === 0) wallCount++
+      // Shrink top edge
+      const removeY = y - radius
+      if (removeY >= 0 && tmp[removeY * width + x] === 0) wallCount--
+    }
+  }
+
+  return out
+}
