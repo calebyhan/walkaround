@@ -153,9 +153,10 @@ function normalizeRoomsInPlace(obj: Record<string, unknown>): void {
     return
   }
 
-  obj['rooms'].forEach((room, index) => {
+  const rooms = obj['rooms']
+  rooms.forEach((room, index) => {
     if (!isRecord(room)) {
-      obj['rooms'][index] = {
+      rooms[index] = {
         id: `room_${index + 1}`,
         name: `Room ${index + 1}`,
         vertices: [],
@@ -169,10 +170,9 @@ function normalizeRoomsInPlace(obj: Record<string, unknown>): void {
     room['id'] = coerceString(room['id'], `room_${index + 1}`)
     room['name'] = coerceString(room['name'], `Room ${index + 1}`)
     room['floor_material'] = coerceString(room['floor_material'], 'unknown')
-    room['ceiling_height'] = coerceNumber(room['ceiling_height'])
-    if (!Number.isFinite(room['ceiling_height']) || room['ceiling_height'] <= 0) {
-      room['ceiling_height'] = 2.4
-    }
+    const ceilingHeight = coerceNumber(room['ceiling_height'])
+    room['ceiling_height'] =
+      Number.isFinite(ceilingHeight) && ceilingHeight > 0 ? ceilingHeight : 2.4
     room['confidence'] = normalizeConfidence(room['confidence'])
 
     if (!Array.isArray(room['vertices'])) {
@@ -188,9 +188,10 @@ function normalizeOpeningsInPlace(wall: Record<string, unknown>): void {
     return
   }
 
-  wall['openings'].forEach((opening, index) => {
+  const openings = wall['openings']
+  openings.forEach((opening, index) => {
     if (!isRecord(opening)) {
-      wall['openings'][index] = {
+      openings[index] = {
         id: `opening_${index + 1}`,
         type: 'door',
         position_along_wall: 0.5,
@@ -215,11 +216,11 @@ function normalizeOpeningsInPlace(wall: Record<string, unknown>): void {
     opening['position_along_wall'] = coerceNumber(opening['position_along_wall'])
     if (!Number.isFinite(opening['position_along_wall'])) opening['position_along_wall'] = 0.5
 
-    opening['width'] = coerceNumber(opening['width'])
-    if (!Number.isFinite(opening['width']) || opening['width'] <= 0) opening['width'] = 0.9
+    const width = coerceNumber(opening['width'])
+    opening['width'] = Number.isFinite(width) && width > 0 ? width : 0.9
 
-    opening['height'] = coerceNumber(opening['height'])
-    if (!Number.isFinite(opening['height']) || opening['height'] <= 0) opening['height'] = 2.1
+    const height = coerceNumber(opening['height'])
+    opening['height'] = Number.isFinite(height) && height > 0 ? height : 2.1
 
     const swing = typeof opening['swing'] === 'string' ? opening['swing'].trim().toLowerCase() : opening['swing']
     if (
@@ -245,9 +246,10 @@ function normalizeWallsInPlace(obj: Record<string, unknown>): void {
     return
   }
 
-  obj['walls'].forEach((wall, index) => {
+  const walls = obj['walls']
+  walls.forEach((wall, index) => {
     if (!isRecord(wall)) {
-      obj['walls'][index] = {
+      walls[index] = {
         id: `wall_${index + 1}`,
         room_ids: [],
         vertices: [],
@@ -273,11 +275,11 @@ function normalizeWallsInPlace(obj: Record<string, unknown>): void {
     }
     normalizePointArrayInPlace(wall['vertices'])
 
-    wall['thickness'] = coerceNumber(wall['thickness'])
-    if (!Number.isFinite(wall['thickness']) || wall['thickness'] <= 0) wall['thickness'] = 0.15
+    const thickness = coerceNumber(wall['thickness'])
+    wall['thickness'] = Number.isFinite(thickness) && thickness > 0 ? thickness : 0.15
 
-    wall['height'] = coerceNumber(wall['height'])
-    if (!Number.isFinite(wall['height']) || wall['height'] <= 0) wall['height'] = 2.4
+    const height = coerceNumber(wall['height'])
+    wall['height'] = Number.isFinite(height) && height > 0 ? height : 2.4
 
     wall['material'] = coerceString(wall['material'], 'plaster')
     wall['is_exterior'] = coerceBoolean(wall['is_exterior'], false)
@@ -292,9 +294,10 @@ function normalizeFurnitureInPlace(obj: Record<string, unknown>): void {
     return
   }
 
-  obj['furniture'].forEach((item, index) => {
+  const furniture = obj['furniture']
+  furniture.forEach((item, index) => {
     if (!isRecord(item)) {
-      obj['furniture'][index] = {
+      furniture[index] = {
         id: `furn_${index + 1}`,
         model_id: 'unknown',
         x: 0,
@@ -754,5 +757,5 @@ export function parseGeminiResponse(rawText: string): FloorPlanSchema {
     })
   }
 
-  return parsed
+  return parsed as FloorPlanSchema
 }

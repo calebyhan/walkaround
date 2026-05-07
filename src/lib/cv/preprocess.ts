@@ -45,7 +45,9 @@ export function downsample(
   srcCanvas.width = src.width
   srcCanvas.height = src.height
   const srcCtx = srcCanvas.getContext('2d')!
-  srcCtx.putImageData(new ImageData(src.data, src.width, src.height), 0, 0)
+  const imageData = srcCtx.createImageData(src.width, src.height)
+  imageData.data.set(src.data)
+  srcCtx.putImageData(imageData, 0, 0)
 
   const dstCanvas = document.createElement('canvas')
   dstCanvas.width = dstW
@@ -86,6 +88,32 @@ export function threshold(grayscale: Uint8Array, cutoff = 180): Uint8Array {
     mask[i] = grayscale[i] >= cutoff ? 1 : 0
   }
   return mask
+}
+
+/**
+ * Threshold for structural wall pixels in common real-estate plans where walls
+ * are medium gray and labels/fixtures are black. Output convention matches
+ * `threshold`: 0 = wall/barrier, 1 = open/background.
+ */
+export function thresholdGrayWalls(
+  grayscale: Uint8Array,
+  minWallGray = 105,
+  maxWallGray = 225,
+): Uint8Array {
+  const mask = new Uint8Array(grayscale.length)
+  for (let i = 0; i < grayscale.length; i++) {
+    const value = grayscale[i]
+    mask[i] = value >= minWallGray && value <= maxWallGray ? 0 : 1
+  }
+  return mask
+}
+
+export function countWallPixels(mask: Uint8Array): number {
+  let count = 0
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i] === 0) count++
+  }
+  return count
 }
 
 /**

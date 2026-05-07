@@ -51,6 +51,43 @@ export interface AILayoutDraft {
   }
   rooms: AIRoomDraft[]
   openings: AIOpeningDraft[]
+  wallMask?: SourceWallMask
+  sourceImage?: SourceImageOverlay
+  sourceImageCrop?: ImagePixelCrop
+}
+
+interface SourceWallMask {
+  mask: Uint8Array
+  width: number
+  height: number
+  sampleRadiusPx: number
+  planBoundsPx?: MaskBounds
+}
+
+interface MaskBounds {
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+interface ResolvedSourceWallMask extends SourceWallMask {
+  planBoundsPx: MaskBounds
+}
+
+interface ImagePixelCrop {
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+interface SourceImageOverlay {
+  base64: string
+  mimeType: 'image/jpeg' | 'image/png'
+  imageWidth: number
+  imageHeight: number
+  crop: ImagePixelCrop
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +128,7 @@ export function bboxToVertices(
 // ---------------------------------------------------------------------------
 
 type Direction = 'north' | 'south' | 'east' | 'west'
+type WallAxis = 'horizontal' | 'vertical'
 
 interface RoomEdge {
   roomId: string
@@ -101,6 +139,14 @@ interface RoomEdge {
   start: number       // start of the range on the varying axis
   end: number         // end of the range on the varying axis
   ceilingHeight: number
+}
+
+interface MaskWallComponent {
+  axis: WallAxis
+  x0: number
+  y0: number
+  x1: number
+  y1: number
 }
 
 /**
@@ -217,34 +263,50 @@ function verticalWallVertices(fixedX: number, y0: number, y1: number): Point[] {
   ]
 }
 
+type EdgeRange = [number, number]
+
 /**
- * Find openings that belong to this wall.
- * An opening matches if its room_id is one of the wall's room_ids AND its wall direction
- * matches either the edge direction or its opposite (for interior shared walls).
+ * Find openings that belong to this generated wall interval.
+ *
+ * AI openings are described against the room edge they came from. Wall generation
+ * may split that room edge into multiple shared/exterior wall intervals, so the
+ * opening's fractional position is remapped from the source room edge to the
+ * generated wall segment.
  */
 function matchOpenings(
-  wallRoomIds: string[],
-  edgeDirections: Direction[],
+  edgeContexts: RoomEdge[],
+  wallStart: number,
+  wallEnd: number,
   openings: AIOpeningDraft[],
 ): Opening[] {
+  const wallLength = wallEnd - wallStart
+  if (wallLength <= EDGE_EPSILON) return []
+
   return openings
-    .filter(
-      (o) =>
-        wallRoomIds.includes(o.room_id) &&
-        edgeDirections.some(
-          (dir) => o.wall === dir || o.wall === oppositeDirection(dir),
-        ),
-    )
-    .map((o): Opening => ({
-      id: o.id,
-      type: o.type,
-      position_along_wall: o.position_along_wall,
-      width: o.width,
-      height: o.height,
-      swing: o.swing as Opening['swing'],
-      sill_height: o.sill_height,
-      confidence: o.confidence,
-    }))
+    .map((opening): Opening | null => {
+      const sourceEdge = edgeContexts.find(
+        (edge) => edge.roomId === opening.room_id && edge.direction === opening.wall,
+      )
+      if (!sourceEdge) return null
+
+      const sourceLength = sourceEdge.end - sourceEdge.start
+      if (sourceLength <= EDGE_EPSILON) return null
+
+      const center = sourceEdge.start + opening.position_along_wall * sourceLength
+      if (center < wallStart - EDGE_EPSILON || center > wallEnd + EDGE_EPSILON) return null
+
+      return {
+        id: opening.id,
+        type: opening.type,
+        position_along_wall: clamp((center - wallStart) / wallLength, 0, 1),
+        width: opening.width,
+        height: opening.height,
+        swing: opening.swing as Opening['swing'],
+        sill_height: opening.sill_height,
+        confidence: opening.confidence,
+      }
+    })
+    .filter((opening): opening is Opening => opening !== null)
 }
 
 let wallCounter = 0
@@ -254,7 +316,9 @@ function makeWall(
   vertices: Point[],
   isExterior: boolean,
   ceilingHeight: number,
-  edgeDirections: Direction[],
+  edgeContexts: RoomEdge[],
+  wallStart: number,
+  wallEnd: number,
   openings: AIOpeningDraft[],
 ): Wall {
   wallCounter += 1
@@ -268,8 +332,87 @@ function makeWall(
     material: 'plaster',
     is_exterior: isExterior,
     confidence: 'medium',
-    openings: matchOpenings(roomIds, edgeDirections, openings),
+    openings: matchOpenings(edgeContexts, wallStart, wallEnd, openings),
   }
+}
+
+function wallHasSourceSupport(
+  vertices: Point[],
+  totalW: number,
+  totalH: number,
+  wallMask: SourceWallMask | undefined,
+): boolean {
+  if (!wallMask) return true
+  const source = resolveSourceWallMask(wallMask)
+  const [a, b] = vertices
+  const ax = planXToMask(a.x, source, totalW)
+  const ay = planYToMask(a.y, source, totalH)
+  const bx = planXToMask(b.x, source, totalW)
+  const by = planYToMask(b.y, source, totalH)
+  const lengthPx = Math.hypot(bx - ax, by - ay)
+  if (lengthPx <= 1) return false
+
+  const samples = Math.max(8, Math.ceil(lengthPx / 8))
+  let supported = 0
+
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples
+    const x = ax + (bx - ax) * t
+    const y = ay + (by - ay) * t
+    if (hasWallPixelNear(wallMask, x, y)) supported++
+  }
+
+  return supported / (samples + 1) >= 0.45
+}
+
+function hasWallPixelNear(wallMask: SourceWallMask, x: number, y: number): boolean {
+  const cx = Math.round(x)
+  const cy = Math.round(y)
+  const radius = wallMask.sampleRadiusPx
+
+  for (let dy = -radius; dy <= radius; dy++) {
+    const py = cy + dy
+    if (py < 0 || py >= wallMask.height) continue
+    for (let dx = -radius; dx <= radius; dx++) {
+      const px = cx + dx
+      if (px < 0 || px >= wallMask.width) continue
+      if (wallMask.mask[py * wallMask.width + px] === 0) return true
+    }
+  }
+
+  return false
+}
+
+function mergeRanges(ranges: EdgeRange[], min: number, max: number): EdgeRange[] {
+  const sorted = ranges
+    .map(([start, end]): EdgeRange => [clamp(start, min, max), clamp(end, min, max)])
+    .filter(([start, end]) => end - start > EDGE_EPSILON)
+    .sort(([a], [b]) => a - b)
+
+  const merged: EdgeRange[] = []
+  for (const range of sorted) {
+    const previous = merged[merged.length - 1]
+    if (!previous || range[0] > previous[1] + EDGE_EPSILON) {
+      merged.push([...range])
+    } else {
+      previous[1] = Math.max(previous[1], range[1])
+    }
+  }
+
+  return merged
+}
+
+function subtractRanges(fullStart: number, fullEnd: number, ranges: EdgeRange[]): EdgeRange[] {
+  const uncovered: EdgeRange[] = []
+  let cursor = fullStart
+
+  for (const [start, end] of mergeRanges(ranges, fullStart, fullEnd)) {
+    if (start - cursor > EDGE_EPSILON) uncovered.push([cursor, start])
+    cursor = Math.max(cursor, end)
+  }
+
+  if (fullEnd - cursor > EDGE_EPSILON) uncovered.push([cursor, fullEnd])
+  return uncovered
 }
 
 /**
@@ -323,6 +466,7 @@ export function generateWalls(
   openings: AIOpeningDraft[],
   totalW: number,
   totalH: number,
+  wallMask?: SourceWallMask,
 ): Wall[] {
   wallCounter = 0
   const walls: Wall[] = []
@@ -333,16 +477,13 @@ export function generateWalls(
   // Compute all edges for all rooms
   const allEdges = snappedRooms.flatMap((r) => computeRoomEdges(r, totalW, totalH))
 
-  // Track which edges have been paired (index into allEdges)
-  const paired = new Set<number>()
+  const coveredRanges: EdgeRange[][] = allEdges.map(() => [])
 
   // Find shared (interior) edges
   for (let i = 0; i < allEdges.length; i++) {
-    if (paired.has(i)) continue
     const edgeA = allEdges[i]
 
     for (let j = i + 1; j < allEdges.length; j++) {
-      if (paired.has(j)) continue
       const edgeB = allEdges[j]
 
       // Different rooms only
@@ -371,45 +512,499 @@ export function generateWalls(
         : verticalWallVertices(avgFixed, lo, hi)
 
       const avgHeight = (edgeA.ceilingHeight + edgeB.ceilingHeight) / 2
-      walls.push(
-        makeWall(
-          [edgeA.roomId, edgeB.roomId],
-          vertices,
-          false,
-          avgHeight,
-          [edgeA.direction, edgeB.direction],
-          openings,
-        ),
-      )
+      if (wallHasSourceSupport(vertices, totalW, totalH, wallMask)) {
+        walls.push(
+          makeWall(
+            [edgeA.roomId, edgeB.roomId],
+            vertices,
+            false,
+            avgHeight,
+            [edgeA, edgeB],
+            lo,
+            hi,
+            openings,
+          ),
+        )
+      }
 
-      paired.add(i)
-      paired.add(j)
-      break
+      coveredRanges[i].push(overlap)
+      coveredRanges[j].push(overlap)
     }
   }
 
-  // Remaining unpaired edges → exterior walls
+  // Uncovered edge intervals → exterior walls. An edge can have multiple
+  // interior overlaps, so this must split instead of treating the whole edge as paired.
   for (let i = 0; i < allEdges.length; i++) {
-    if (paired.has(i)) continue
     const edge = allEdges[i]
     const horiz = isHorizontal(edge.direction)
-    const vertices = horiz
-      ? horizontalWallVertices(edge.fixedCoord, edge.start, edge.end)
-      : verticalWallVertices(edge.fixedCoord, edge.start, edge.end)
 
-    walls.push(
-      makeWall(
-        [edge.roomId],
-        vertices,
-        true,
-        edge.ceilingHeight,
-        [edge.direction],
-        openings,
-      ),
-    )
+    for (const [start, end] of subtractRanges(edge.start, edge.end, coveredRanges[i])) {
+      const vertices = horiz
+        ? horizontalWallVertices(edge.fixedCoord, start, end)
+        : verticalWallVertices(edge.fixedCoord, start, end)
+
+      if (wallHasSourceSupport(vertices, totalW, totalH, wallMask)) {
+        walls.push(
+          makeWall(
+            [edge.roomId],
+            vertices,
+            true,
+            edge.ceilingHeight,
+            [edge],
+            start,
+            end,
+            openings,
+          ),
+        )
+      }
+    }
   }
 
   return walls
+}
+
+function generateWallsFromMask(
+  wallMask: SourceWallMask,
+  rooms: AIRoomDraft[],
+  totalW: number,
+  totalH: number,
+): Wall[] {
+  wallCounter = 0
+  const source = resolveSourceWallMask(wallMask)
+  const candidates = extractWallComponents(source)
+  const components = candidates
+    .filter((component) => maskComponentHasStructuralSupport(component, rooms, source))
+  const walls = components
+    .map((component) => maskComponentToWall(component, rooms, source, totalW, totalH))
+    .filter((wall): wall is Wall => wall !== null)
+
+  console.log(
+    `[walkaround/cv] Generated ${walls.length} source-mask wall segments ` +
+    `(${components.length}/${candidates.length} candidates after structural-support filter)`,
+  )
+  return walls
+}
+
+function renumberWalls(walls: Wall[]): Wall[] {
+  return walls.map((wall, index) => ({
+    ...wall,
+    id: `wall_${index + 1}`,
+  }))
+}
+
+function extractWallComponents(wallMask: ResolvedSourceWallMask): MaskWallComponent[] {
+  const { mask, width, height } = wallMask
+  const cropW = wallMask.planBoundsPx.x1 - wallMask.planBoundsPx.x0
+  const cropH = wallMask.planBoundsPx.y1 - wallMask.planBoundsPx.y0
+  const shortSide = Math.min(cropW, cropH)
+  const minRunLength = Math.max(36, Math.round(shortSide * 0.03))
+  const minThickness = Math.max(6, Math.round(shortSide * 0.0055))
+  const maxThickness = Math.max(28, Math.round(shortSide * 0.035))
+
+  const horizontalCandidates = markAxisRuns(mask, width, height, 'horizontal', minRunLength)
+  const verticalCandidates = markAxisRuns(mask, width, height, 'vertical', minRunLength)
+
+  return [
+    ...candidateComponents(horizontalCandidates, width, height, 'horizontal', minRunLength, minThickness, maxThickness),
+    ...candidateComponents(verticalCandidates, width, height, 'vertical', minRunLength, minThickness, maxThickness),
+  ]
+}
+
+function markAxisRuns(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  axis: WallAxis,
+  minRunLength: number,
+): Uint8Array {
+  const candidates = new Uint8Array(mask.length)
+
+  if (axis === 'horizontal') {
+    for (let y = 0; y < height; y++) {
+      let x = 0
+      while (x < width) {
+        while (x < width && mask[y * width + x] !== 0) x++
+        const start = x
+        while (x < width && mask[y * width + x] === 0) x++
+        if (x - start >= minRunLength) {
+          for (let px = start; px < x; px++) candidates[y * width + px] = 1
+        }
+      }
+    }
+    return candidates
+  }
+
+  for (let x = 0; x < width; x++) {
+    let y = 0
+    while (y < height) {
+      while (y < height && mask[y * width + x] !== 0) y++
+      const start = y
+      while (y < height && mask[y * width + x] === 0) y++
+      if (y - start >= minRunLength) {
+        for (let py = start; py < y; py++) candidates[py * width + x] = 1
+      }
+    }
+  }
+
+  return candidates
+}
+
+function candidateComponents(
+  candidates: Uint8Array,
+  width: number,
+  height: number,
+  axis: WallAxis,
+  minRunLength: number,
+  minThickness: number,
+  maxThickness: number,
+): MaskWallComponent[] {
+  const visited = new Uint8Array(candidates.length)
+  const queue = new Int32Array(candidates.length)
+  const components: MaskWallComponent[] = []
+
+  for (let i = 0; i < candidates.length; i++) {
+    if (visited[i] || candidates[i] === 0) continue
+
+    let head = 0
+    let tail = 0
+    let minX = width
+    let minY = height
+    let maxX = 0
+    let maxY = 0
+    let area = 0
+
+    visited[i] = 1
+    queue[tail++] = i
+
+    while (head < tail) {
+      const idx = queue[head++]
+      const x = idx % width
+      const y = (idx - x) / width
+      area++
+      minX = Math.min(minX, x)
+      minY = Math.min(minY, y)
+      maxX = Math.max(maxX, x)
+      maxY = Math.max(maxY, y)
+
+      const neighbours = [
+        x > 0 ? idx - 1 : -1,
+        x < width - 1 ? idx + 1 : -1,
+        y > 0 ? idx - width : -1,
+        y < height - 1 ? idx + width : -1,
+      ]
+      for (const next of neighbours) {
+        if (next < 0 || visited[next] || candidates[next] === 0) continue
+        visited[next] = 1
+        queue[tail++] = next
+      }
+    }
+
+    const componentWidth = maxX - minX + 1
+    const componentHeight = maxY - minY + 1
+    const longSide = axis === 'horizontal' ? componentWidth : componentHeight
+    const shortSide = axis === 'horizontal' ? componentHeight : componentWidth
+    const fill = area / (componentWidth * componentHeight)
+
+    if (
+      longSide >= minRunLength &&
+      shortSide >= minThickness &&
+      shortSide <= maxThickness &&
+      longSide / shortSide >= 3 &&
+      fill >= 0.35
+    ) {
+      components.push({ axis, x0: minX, y0: minY, x1: maxX + 1, y1: maxY + 1 })
+    }
+  }
+
+  return mergeMaskWallComponents(components)
+}
+
+function mergeMaskWallComponents(components: MaskWallComponent[]): MaskWallComponent[] {
+  const byAxis = new Map<WallAxis, MaskWallComponent[]>()
+  components.forEach((component) => {
+    byAxis.set(component.axis, [...(byAxis.get(component.axis) ?? []), component])
+  })
+
+  const merged: MaskWallComponent[] = []
+  byAxis.forEach((axisComponents, axis) => {
+    const sorted = axisComponents.sort((a, b) =>
+      axis === 'horizontal' ? a.y0 - b.y0 || a.x0 - b.x0 : a.x0 - b.x0 || a.y0 - b.y0,
+    )
+
+    for (const component of sorted) {
+      const previous = merged.find((candidate) =>
+        candidate.axis === axis && maskComponentsCanMerge(candidate, component),
+      )
+      if (previous) {
+        previous.x0 = Math.min(previous.x0, component.x0)
+        previous.y0 = Math.min(previous.y0, component.y0)
+        previous.x1 = Math.max(previous.x1, component.x1)
+        previous.y1 = Math.max(previous.y1, component.y1)
+      } else {
+        merged.push({ ...component })
+      }
+    }
+  })
+
+  return merged
+}
+
+function maskComponentsCanMerge(a: MaskWallComponent, b: MaskWallComponent): boolean {
+  const sameAxisTolerance = 4
+  const gapTolerance = 4
+
+  if (a.axis === 'horizontal') {
+    const centerA = (a.y0 + a.y1) / 2
+    const centerB = (b.y0 + b.y1) / 2
+    if (Math.abs(centerA - centerB) > sameAxisTolerance) return false
+    return rangesTouchOrOverlap(a.x0, a.x1, b.x0, b.x1, gapTolerance)
+  }
+
+  const centerA = (a.x0 + a.x1) / 2
+  const centerB = (b.x0 + b.x1) / 2
+  if (Math.abs(centerA - centerB) > sameAxisTolerance) return false
+  return rangesTouchOrOverlap(a.y0, a.y1, b.y0, b.y1, gapTolerance)
+}
+
+function rangesTouchOrOverlap(a0: number, a1: number, b0: number, b1: number, tolerance: number): boolean {
+  return Math.max(a0, b0) <= Math.min(a1, b1) + tolerance
+}
+
+function maskComponentToWall(
+  component: MaskWallComponent,
+  rooms: AIRoomDraft[],
+  wallMask: ResolvedSourceWallMask,
+  totalW: number,
+  totalH: number,
+): Wall | null {
+  wallCounter += 1
+  const bounds = wallMask.planBoundsPx
+  const cropW = bounds.x1 - bounds.x0
+  const cropH = bounds.y1 - bounds.y0
+  const roomIds = roomIdsNearMaskWall(component, rooms, wallMask)
+
+  const thickness = component.axis === 'horizontal'
+    ? clamp(((component.y1 - component.y0) / cropH) * totalH, 0.08, 0.35)
+    : clamp(((component.x1 - component.x0) / cropW) * totalW, 0.08, 0.35)
+
+  const vertices = component.axis === 'horizontal'
+    ? [
+        {
+          x: maskXToPlan(component.x0, wallMask, totalW),
+          y: maskYToPlan((component.y0 + component.y1) / 2, wallMask, totalH),
+        },
+        {
+          x: maskXToPlan(component.x1, wallMask, totalW),
+          y: maskYToPlan((component.y0 + component.y1) / 2, wallMask, totalH),
+        },
+      ]
+    : [
+        {
+          x: maskXToPlan((component.x0 + component.x1) / 2, wallMask, totalW),
+          y: maskYToPlan(component.y1, wallMask, totalH),
+        },
+        {
+          x: maskXToPlan((component.x0 + component.x1) / 2, wallMask, totalW),
+          y: maskYToPlan(component.y0, wallMask, totalH),
+        },
+      ]
+
+  if (pointDistance(vertices[0], vertices[1]) < 0.2) return null
+
+  return {
+    id: `wall_${wallCounter}`,
+    room_ids: roomIds,
+    vertices,
+    thickness,
+    height: 2.7,
+    material: 'plaster',
+    is_exterior: isLikelyExteriorMaskWall(component, rooms, wallMask),
+    confidence: 'medium',
+    openings: [],
+  }
+}
+
+function roomIdsNearMaskWall(
+  component: MaskWallComponent,
+  rooms: AIRoomDraft[],
+  wallMask: ResolvedSourceWallMask,
+): string[] {
+  const bounds = wallMask.planBoundsPx
+  const cropW = bounds.x1 - bounds.x0
+  const cropH = bounds.y1 - bounds.y0
+  const tolerancePx = Math.max(14, Math.round(Math.min(cropW, cropH) * 0.012))
+  const ids = rooms
+    .filter((room) => {
+      const bbox = room.image_bbox
+      const rx0 = bounds.x0 + bbox.x0 * cropW
+      const rx1 = bounds.x0 + bbox.x1 * cropW
+      const ry0 = bounds.y0 + bbox.y0 * cropH
+      const ry1 = bounds.y0 + bbox.y1 * cropH
+
+      if (component.axis === 'horizontal') {
+        const y = (component.y0 + component.y1) / 2
+        const overlapsX = Math.min(component.x1, rx1) - Math.max(component.x0, rx0) > tolerancePx
+        return overlapsX && (Math.abs(y - ry0) <= tolerancePx || Math.abs(y - ry1) <= tolerancePx)
+      }
+
+      const x = (component.x0 + component.x1) / 2
+      const overlapsY = Math.min(component.y1, ry1) - Math.max(component.y0, ry0) > tolerancePx
+      return overlapsY && (Math.abs(x - rx0) <= tolerancePx || Math.abs(x - rx1) <= tolerancePx)
+    })
+    .map((room) => room.id)
+
+  return [...new Set(ids)].slice(0, 2)
+}
+
+function maskComponentHasStructuralSupport(
+  component: MaskWallComponent,
+  rooms: AIRoomDraft[],
+  wallMask: ResolvedSourceWallMask,
+): boolean {
+  if (rooms.length === 0) return true
+  if (maskComponentTouchesPlanEdge(component, wallMask)) return true
+  return roomIdsNearMaskWall(component, rooms, wallMask).length > 0
+}
+
+function maskComponentTouchesPlanEdge(
+  component: MaskWallComponent,
+  wallMask: ResolvedSourceWallMask,
+): boolean {
+  const bounds = wallMask.planBoundsPx
+  const cropW = bounds.x1 - bounds.x0
+  const cropH = bounds.y1 - bounds.y0
+  const tolerancePx = Math.max(10, Math.round(Math.min(cropW, cropH) * 0.012))
+
+  if (component.axis === 'horizontal') {
+    const y = (component.y0 + component.y1) / 2
+    return Math.abs(y - bounds.y0) <= tolerancePx || Math.abs(y - bounds.y1) <= tolerancePx
+  }
+
+  const x = (component.x0 + component.x1) / 2
+  return Math.abs(x - bounds.x0) <= tolerancePx || Math.abs(x - bounds.x1) <= tolerancePx
+}
+
+function isLikelyExteriorMaskWall(
+  component: MaskWallComponent,
+  rooms: AIRoomDraft[],
+  wallMask: ResolvedSourceWallMask,
+): boolean {
+  if (rooms.length === 0) return true
+  const bounds = wallMask.planBoundsPx
+  const cropW = bounds.x1 - bounds.x0
+  const cropH = bounds.y1 - bounds.y0
+  const minX = Math.min(...rooms.map((room) => bounds.x0 + room.image_bbox.x0 * cropW))
+  const maxX = Math.max(...rooms.map((room) => bounds.x0 + room.image_bbox.x1 * cropW))
+  const minY = Math.min(...rooms.map((room) => bounds.y0 + room.image_bbox.y0 * cropH))
+  const maxY = Math.max(...rooms.map((room) => bounds.y0 + room.image_bbox.y1 * cropH))
+  const tolerance = Math.max(18, Math.round(Math.min(cropW, cropH) * 0.015))
+
+  if (component.axis === 'horizontal') {
+    const y = (component.y0 + component.y1) / 2
+    return Math.abs(y - minY) <= tolerance || Math.abs(y - maxY) <= tolerance
+  }
+
+  const x = (component.x0 + component.x1) / 2
+  return Math.abs(x - minX) <= tolerance || Math.abs(x - maxX) <= tolerance
+}
+
+function resolveSourceWallMask(wallMask: SourceWallMask): ResolvedSourceWallMask {
+  return {
+    ...wallMask,
+    planBoundsPx: wallMask.planBoundsPx ?? computeWallMaskBounds(wallMask.mask, wallMask.width, wallMask.height),
+  }
+}
+
+function computeWallMaskBounds(mask: Uint8Array, width: number, height: number): MaskBounds {
+  const shortSide = Math.min(width, height)
+  const cropRunLength = Math.max(32, Math.round(shortSide * 0.04))
+  const cropMinThickness = Math.max(4, Math.round(shortSide * 0.003))
+  const cropMaxThickness = Math.max(28, Math.round(shortSide * 0.035))
+  const components = [
+    ...candidateComponents(
+      markAxisRuns(mask, width, height, 'horizontal', cropRunLength),
+      width,
+      height,
+      'horizontal',
+      cropRunLength,
+      cropMinThickness,
+      cropMaxThickness,
+    ),
+    ...candidateComponents(
+      markAxisRuns(mask, width, height, 'vertical', cropRunLength),
+      width,
+      height,
+      'vertical',
+      cropRunLength,
+      cropMinThickness,
+      cropMaxThickness,
+    ),
+  ]
+
+  if (components.length > 0) {
+    const minX = Math.min(...components.map((component) => component.x0))
+    const minY = Math.min(...components.map((component) => component.y0))
+    const maxX = Math.max(...components.map((component) => component.x1))
+    const maxY = Math.max(...components.map((component) => component.y1))
+    const padding = Math.max(2, Math.round(shortSide * 0.003))
+    return {
+      x0: clamp(minX - padding, 0, width - 1),
+      y0: clamp(minY - padding, 0, height - 1),
+      x1: clamp(maxX + padding, 1, width),
+      y1: clamp(maxY + padding, 1, height),
+    }
+  }
+
+  let minX = width
+  let minY = height
+  let maxX = -1
+  let maxY = -1
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (mask[y * width + x] !== 0) continue
+      minX = Math.min(minX, x)
+      minY = Math.min(minY, y)
+      maxX = Math.max(maxX, x)
+      maxY = Math.max(maxY, y)
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return { x0: 0, y0: 0, x1: width, y1: height }
+  }
+
+  const padding = Math.max(2, Math.round(shortSide * 0.003))
+  return {
+    x0: clamp(minX - padding, 0, width - 1),
+    y0: clamp(minY - padding, 0, height - 1),
+    x1: clamp(maxX + 1 + padding, 1, width),
+    y1: clamp(maxY + 1 + padding, 1, height),
+  }
+}
+
+function maskXToPlan(x: number, wallMask: ResolvedSourceWallMask, totalW: number): number {
+  const bounds = wallMask.planBoundsPx
+  const cropW = Math.max(1, bounds.x1 - bounds.x0)
+  return clamp((x - bounds.x0) / cropW, 0, 1) * totalW
+}
+
+function maskYToPlan(y: number, wallMask: ResolvedSourceWallMask, totalH: number): number {
+  const bounds = wallMask.planBoundsPx
+  const cropH = Math.max(1, bounds.y1 - bounds.y0)
+  return (1 - clamp((y - bounds.y0) / cropH, 0, 1)) * totalH
+}
+
+function planXToMask(x: number, wallMask: ResolvedSourceWallMask, totalW: number): number {
+  const bounds = wallMask.planBoundsPx
+  const cropW = Math.max(1, bounds.x1 - bounds.x0)
+  return bounds.x0 + clamp(x / totalW, 0, 1) * cropW
+}
+
+function planYToMask(y: number, wallMask: ResolvedSourceWallMask, totalH: number): number {
+  const bounds = wallMask.planBoundsPx
+  const cropH = Math.max(1, bounds.y1 - bounds.y0)
+  return bounds.y0 + (1 - clamp(y / totalH, 0, 1)) * cropH
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +1025,28 @@ export function convertDraftToSchema(draft: AILayoutDraft): FloorPlanSchema {
     confidence: r.confidence,
   }))
 
-  const walls = generateWalls(draft.rooms, draft.openings, totalW, totalH)
+  const maskWalls = draft.wallMask
+    ? generateWallsFromMask(draft.wallMask, draft.rooms, totalW, totalH)
+    : []
+  const edgeWalls = maskWalls.length > 0
+    ? []
+    : generateWalls(draft.rooms, draft.openings, totalW, totalH, draft.wallMask)
+  if (maskWalls.length > 0) {
+    console.log('[walkaround/cv] Using source-mask walls only; skipped room-edge wall additions')
+  }
+  const walls = renumberWalls(maskWalls.length > 0 ? maskWalls : edgeWalls)
+  const annotations: unknown[] = draft.sourceImage
+    ? [
+        {
+          type: 'source_image_overlay',
+          data: draft.sourceImage.base64,
+          mimeType: draft.sourceImage.mimeType,
+          imageWidth: draft.sourceImage.imageWidth,
+          imageHeight: draft.sourceImage.imageHeight,
+          crop: draft.sourceImage.crop,
+        },
+      ]
+    : []
 
   return {
     meta: {
@@ -445,7 +1061,7 @@ export function convertDraftToSchema(draft: AILayoutDraft): FloorPlanSchema {
     walls,
     structural: [],
     furniture: [],
-    annotations: [],
+    annotations,
     issues: [],
   }
 }
@@ -522,6 +1138,10 @@ function coerceNumber(value: unknown): number {
 
 function clamp(value: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, value))
+}
+
+function pointDistance(a: Point, b: Point): number {
+  return Math.hypot(a.x - b.x, a.y - b.y)
 }
 
 function coerceString(value: unknown, fallback: string): string {
@@ -771,6 +1391,7 @@ export interface LLMSemanticOutput {
   floor_name: string
   plan_width_m: number | null
   plan_height_m: number | null
+  total_area_m2: number | null
   rooms: LLMRoomLabel[]
   openings: LLMOpeningLabel[]
 }
@@ -852,10 +1473,18 @@ export function parseLLMSemanticOutput(rawText: string): LLMSemanticOutput {
 
   const rawPW = coerceNumber(parsed['plan_width_m'])
   const rawPH = coerceNumber(parsed['plan_height_m'])
+  const rawAreaM2 = coerceNumber(parsed['total_area_m2'])
+  const rawAreaSqft = coerceNumber(parsed['total_area_sqft'])
   const plan_width_m = Number.isFinite(rawPW) && rawPW > 0 ? rawPW : null
   const plan_height_m = Number.isFinite(rawPH) && rawPH > 0 ? rawPH : null
+  const total_area_m2 =
+    Number.isFinite(rawAreaM2) && rawAreaM2 > 0
+      ? rawAreaM2
+      : Number.isFinite(rawAreaSqft) && rawAreaSqft > 0
+        ? rawAreaSqft * 0.09290304
+        : null
 
-  return { floor_name, plan_width_m, plan_height_m, rooms, openings }
+  return { floor_name, plan_width_m, plan_height_m, total_area_m2, rooms, openings }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,11 +1500,137 @@ function median(values: number[]): number {
     : sorted[mid]
 }
 
+function robustScaleEstimate(samples: Array<{ scale: number; confidence: Confidence }>): {
+  scale: number | null
+  kept: number
+  total: number
+} {
+  const finite = samples.filter((sample) => Number.isFinite(sample.scale) && sample.scale > 0)
+  if (finite.length === 0) return { scale: null, kept: 0, total: 0 }
+
+  const highConfidence = finite.filter((sample) => sample.confidence === 'high')
+  const preferred = highConfidence.length >= 2 ? highConfidence : finite.filter((sample) => sample.confidence !== 'low')
+  const usable = preferred.length > 0 ? preferred : finite
+  const center = median(usable.map((sample) => sample.scale))
+  const filtered = usable.filter((sample) => {
+    const ratio = Math.max(sample.scale, center) / Math.min(sample.scale, center)
+    return ratio <= 1.35
+  })
+  const finalSamples = filtered.length >= 2 ? filtered : usable
+
+  return {
+    scale: median(finalSamples.map((sample) => sample.scale)),
+    kept: finalSamples.length,
+    total: finite.length,
+  }
+}
+
+function chooseAxisExtent(
+  axis: 'width' | 'height',
+  pixelExtent: number,
+  sampleScale: number | null,
+  llmExtent: number | null,
+  fallbackScale: number,
+): { extent: number; source: string } {
+  const sampleExtent = sampleScale !== null ? pixelExtent * sampleScale : null
+
+  if (sampleExtent !== null) {
+    if (llmExtent !== null) {
+      const ratio = Math.max(sampleExtent, llmExtent) / Math.min(sampleExtent, llmExtent)
+      if (ratio > 1.15) {
+        console.log(
+          `[walkaround/cv] Ignoring LLM plan_${axis}_m=${llmExtent.toFixed(3)}m; ` +
+          `room dimension samples imply ${sampleExtent.toFixed(3)}m`,
+        )
+      }
+    }
+    return { extent: sampleExtent, source: 'room dimensions' }
+  }
+
+  if (llmExtent !== null) return { extent: llmExtent, source: 'LLM plan extent fallback' }
+  return { extent: pixelExtent * fallbackScale, source: 'pixel fallback' }
+}
+
+function chooseCVPlanScale(
+  cv: CVPipelineResult,
+  llm: LLMSemanticOutput,
+  planImageW: number,
+  planImageH: number,
+  xScale: number | null,
+  yScale: number | null,
+): {
+  totalW: number
+  totalH: number
+  widthSource: string
+  heightSource: string
+} {
+  const interiorAreaPx = cv.regions.reduce((sum, region) => sum + region.pixelArea, 0) * cv.downsampleScale ** 2
+  const cropAreaPx = planImageW * planImageH
+  const fillRatio = cropAreaPx > 0 ? interiorAreaPx / cropAreaPx : 0
+  const areaScale =
+    llm.total_area_m2 !== null && interiorAreaPx > 0
+      ? Math.sqrt(llm.total_area_m2 / interiorAreaPx)
+      : null
+
+  if (areaScale !== null) {
+    console.log(
+      `[walkaround/cv] Scale from total_area_m2=${llm.total_area_m2!.toFixed(2)}m²: ` +
+      `${areaScale.toFixed(4)} m/px (CV floor fill=${(fillRatio * 100).toFixed(0)}%)`,
+    )
+
+    if (xScale !== null && yScale !== null && llm.total_area_m2 !== null) {
+      const sampledArea = xScale * yScale * interiorAreaPx
+      console.log(
+        `[walkaround/cv] Using printed area instead of room dimension scale: ` +
+        `sampled floor area would be ${sampledArea.toFixed(1)}m² vs printed ${llm.total_area_m2.toFixed(1)}m²`,
+      )
+    }
+
+    return {
+      totalW: planImageW * areaScale,
+      totalH: planImageH * areaScale,
+      widthSource: 'printed area + CV floor mask',
+      heightSource: 'printed area + CV floor mask',
+    }
+  }
+
+  const fallbackScale = xScale ?? yScale ?? areaScale ?? 0.01
+  const widthChoice = chooseAxisExtent('width', planImageW, xScale, llm.plan_width_m, fallbackScale)
+  const heightChoice = chooseAxisExtent('height', planImageH, yScale, llm.plan_height_m, fallbackScale)
+
+  return {
+    totalW: widthChoice.extent,
+    totalH: heightChoice.extent,
+    widthSource: widthChoice.source,
+    heightSource: heightChoice.source,
+  }
+}
+
 export function mergeWithLLMLabels(
   cv: CVPipelineResult,
   llm: LLMSemanticOutput,
 ): AILayoutDraft {
   const { imageWidth: W, imageHeight: H, regions } = cv
+  const sourceWallMask = resolveSourceWallMask({
+    mask: cv.wallMask,
+    width: cv.wallMaskWidth,
+    height: cv.wallMaskHeight,
+    sampleRadiusPx: cv.wallSampleRadiusPx,
+  })
+  const maskBounds = sourceWallMask.planBoundsPx
+  const planImageBounds = {
+    x0: (maskBounds.x0 / cv.wallMaskWidth) * W,
+    y0: (maskBounds.y0 / cv.wallMaskHeight) * H,
+    x1: (maskBounds.x1 / cv.wallMaskWidth) * W,
+    y1: (maskBounds.y1 / cv.wallMaskHeight) * H,
+  }
+  const planImageW = Math.max(1, planImageBounds.x1 - planImageBounds.x0)
+  const planImageH = Math.max(1, planImageBounds.y1 - planImageBounds.y0)
+  console.log(
+    `[walkaround/cv] Plan crop from wall mask: ` +
+    `${Math.round(planImageBounds.x0)},${Math.round(planImageBounds.y0)} ` +
+    `${Math.round(planImageW)}×${Math.round(planImageH)}px`,
+  )
 
   // Build a lookup: region_id → LLMRoomLabel
   const labelMap = new Map<number, LLMRoomLabel>(llm.rooms.map((r) => [r.region_id, r]))
@@ -883,62 +1638,45 @@ export function mergeWithLLMLabels(
   // Compute pixel→meter scale from rooms that have usable labeled dimensions.
   // X (horizontal) and Y (vertical) scales are tracked separately to detect
   // anisotropic scans; a single global scale is only used if they agree.
-  const xScales: number[] = []
-  const yScales: number[] = []
+  const xSamples: Array<{ scale: number; confidence: Confidence }> = []
+  const ySamples: Array<{ scale: number; confidence: Confidence }> = []
   for (const region of regions) {
     const label = labelMap.get(region.id)
     if (!label) continue
     if (label.width_m > 0 && region.originalBBox.w > 0) {
-      xScales.push(label.width_m / region.originalBBox.w)
+      xSamples.push({ scale: label.width_m / region.originalBBox.w, confidence: label.confidence })
     }
     if (label.depth_m > 0 && region.originalBBox.h > 0) {
-      yScales.push(label.depth_m / region.originalBBox.h)
+      ySamples.push({ scale: label.depth_m / region.originalBBox.h, confidence: label.confidence })
     }
   }
 
-  const xScale = xScales.length > 0 ? median(xScales) : null
-  const yScale = yScales.length > 0 ? median(yScales) : null
+  const xEstimate = robustScaleEstimate(xSamples)
+  const yEstimate = robustScaleEstimate(ySamples)
+  const xScale = xEstimate.scale
+  const yScale = yEstimate.scale
+  console.log(
+    `[walkaround/cv] Scale from room dimension samples: ` +
+    `x=${xScale?.toFixed(4) ?? 'n/a'} m/px (${xEstimate.kept}/${xEstimate.total}), ` +
+    `y=${yScale?.toFixed(4) ?? 'n/a'} m/px (${yEstimate.kept}/${yEstimate.total})`,
+  )
 
   if (xScale !== null && yScale !== null) {
     const ratio = Math.max(xScale, yScale) / Math.min(xScale, yScale)
     if (ratio > 1.1) {
       console.log(
         `[walkaround/cv] Per-room X/Y scale differ by ${((ratio - 1) * 100).toFixed(0)}% ` +
-        `— using plan_width_m/plan_height_m for correct anisotropic bounds`,
+        `— treating room-derived scale as diagnostic unless no better scale anchor exists`,
       )
     }
   }
 
-  // Prefer plan-level dimensions (single reliable measurement) over per-room aggregation.
-  // Per-room scale is noisy when grid cells partially overlap rooms.
-  let globalScale: number
-  if (llm.plan_width_m !== null) {
-    globalScale = llm.plan_width_m / W
-    console.log(
-      `[walkaround/cv] Scale from plan_width_m=${llm.plan_width_m}m: ${globalScale.toFixed(4)} m/px`,
-    )
-  } else if (xScales.length > 0) {
-    globalScale = xScale!
-    console.log(
-      `[walkaround/cv] Scale from x-samples (no plan_width_m): ${globalScale.toFixed(4)} m/px ` +
-      `(${xScales.length} samples)`,
-    )
-  } else {
-    const allScales = [...xScales, ...yScales]
-    globalScale = allScales.length > 0 ? median(allScales) : 0.01
-    console.log(
-      `[walkaround/cv] Scale from per-room fallback: ${globalScale.toFixed(4)} m/px ` +
-      `(${xScales.length} x-samples, ${yScales.length} y-samples)`,
-    )
-  }
-
-  // Use plan-level dimensions directly when available for accurate anisotropic scaling.
-  // Y-scale may differ from X-scale when the image has non-square pixel-per-meter density.
-  const totalW = llm.plan_width_m ?? W * globalScale
-  const totalH = llm.plan_height_m ?? H * globalScale
+  const scaleChoice = chooseCVPlanScale(cv, llm, planImageW, planImageH, xScale, yScale)
+  const totalW = scaleChoice.totalW
+  const totalH = scaleChoice.totalH
   console.log(
     `[walkaround/cv] Plan bounds: ${totalW.toFixed(2)}m × ${totalH.toFixed(2)}m ` +
-    `(${llm.plan_width_m !== null ? 'LLM' : 'CV'} width, ${llm.plan_height_m !== null ? 'LLM' : 'CV'} height)`,
+    `(${scaleChoice.widthSource} width, ${scaleChoice.heightSource} height)`,
   )
 
   // Build AIRoomDraft for each detected region
@@ -947,20 +1685,20 @@ export function mergeWithLLMLabels(
     const { x, y, w, h } = region.originalBBox
 
     const image_bbox: ImageBBox = {
-      x0: x / W,
-      y0: y / H,
-      x1: (x + w) / W,
-      y1: (y + h) / H,
+      x0: clamp((x - planImageBounds.x0) / planImageW, 0, 1),
+      y0: clamp((y - planImageBounds.y0) / planImageH, 0, 1),
+      x1: clamp((x + w - planImageBounds.x0) / planImageW, 0, 1),
+      y1: clamp((y + h - planImageBounds.y0) / planImageH, 0, 1),
     }
 
     // Convert the CV polygon from original pixel coordinates to metre coordinates.
     // Pixel origin: top-left, y downward.  Metre origin: bottom-left, y upward.
-    //   x_m = (x_px / imageWidth)  * totalW
-    //   y_m = (1 - y_px / imageHeight) * totalH
+    // Coordinates are normalized through the detected structural-wall crop, not
+    // the full image canvas, so margins and marketing text do not distort geometry.
     const polygon_m: Point[] | undefined = region.originalPolygon.length >= 4
       ? region.originalPolygon.map((pt) => ({
-          x: (pt.x / W) * totalW,
-          y: (1 - pt.y / H) * totalH,
+          x: clamp((pt.x - planImageBounds.x0) / planImageW, 0, 1) * totalW,
+          y: (1 - clamp((pt.y - planImageBounds.y0) / planImageH, 0, 1)) * totalH,
         }))
       : undefined
 
@@ -1007,5 +1745,7 @@ export function mergeWithLLMLabels(
     },
     rooms,
     openings,
+    wallMask: sourceWallMask,
+    sourceImageCrop: planImageBounds,
   }
 }

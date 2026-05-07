@@ -114,24 +114,24 @@ export function FirstPersonController({ wallAabbs, onExit }: Props) {
 // Try to move from `current` to `desired` along `axis`, testing against AABBs.
 // Returns the resolved position for that axis.
 function resolveAxis(
-  currentX: number,
-  desiredX: number,
-  currentZ: number,
+  current: number,
+  desired: number,
+  otherAxisPosition: number,
   aabbs: WallAabb[],
   axis: 'x' | 'z',
 ): number {
   const PLAYER_RADIUS = 0.2
 
-  const testX = axis === 'x' ? desiredX : currentX
-  const testZ = axis === 'z' ? desiredX : currentZ
+  const testX = axis === 'x' ? desired : otherAxisPosition
+  const testZ = axis === 'z' ? desired : otherAxisPosition
 
   for (const aabb of aabbs) {
     const overlapX = testX > aabb.minX - PLAYER_RADIUS && testX < aabb.maxX + PLAYER_RADIUS
     const overlapZ = testZ > aabb.minZ - PLAYER_RADIUS && testZ < aabb.maxZ + PLAYER_RADIUS
     if (overlapX && overlapZ) {
-      return axis === 'x' ? currentX : currentZ
+      return current
     }
   }
 
-  return desiredX
+  return desired
 }

@@ -16,6 +16,12 @@ const MIN_AREA_FRACTION = 0.005
 // Maximum number of room regions to return.
 const MAX_REGIONS = 30
 
+// Watershed can split one open room into multiple seeds. If two labels share a
+// long open boundary, merge them; narrow contacts are usually door openings and
+// should remain separate semantic rooms.
+const MERGE_CONTACT_FRACTION = 0.22
+const MIN_USEFUL_MERGED_FRACTION = 0.45
+
 interface RegionStats {
   label: number
   area: number
@@ -65,8 +71,21 @@ export function detectRegions(mask: Uint8Array, width: number, height: number): 
   // Step 3: Watershed
   const labels = seededWatershed(mask, seeds, width, height)
 
-  // Step 4: Extract regions + polygons, discarding border-touching (exterior) regions
-  return extractWatershedRegions(labels, seeds.length, width, height)
+  // Step 4: Merge long open-space watershed splits, then extract regions.
+  const rawRegions = extractWatershedRegions(labels, seeds.length, width, height)
+  const mergedLabels = mergeOpenSpaceSplits(labels, seeds.length, width, height)
+  const mergedRegions = extractWatershedRegions(mergedLabels.labels, mergedLabels.numLabels, width, height)
+
+  const minUsefulMergedCount = Math.max(3, Math.ceil(rawRegions.length * MIN_USEFUL_MERGED_FRACTION))
+  if (rawRegions.length >= 3 && mergedRegions.length < minUsefulMergedCount) {
+    console.warn(
+      `[walkaround/cv] Rejecting over-merged regions: ${rawRegions.length} raw → ` +
+      `${mergedRegions.length} merged; keeping raw watershed regions`,
+    )
+    return rawRegions
+  }
+
+  return mergedRegions
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +265,92 @@ function seededWatershed(
 // ---------------------------------------------------------------------------
 // Region extraction
 // ---------------------------------------------------------------------------
+
+function mergeOpenSpaceSplits(
+  labels: Int32Array,
+  numSeeds: number,
+  width: number,
+  height: number,
+): { labels: Int32Array; numLabels: number } {
+  const parent = Array.from({ length: numSeeds + 1 }, (_, i) => i)
+  const areas = new Int32Array(numSeeds + 1)
+  const contactCounts = new Map<string, number>()
+  const minContact = Math.round(Math.min(width, height) * MERGE_CONTACT_FRACTION)
+
+  for (let idx = 0; idx < labels.length; idx++) {
+    const label = labels[idx]
+    if (label > 0) areas[label]++
+  }
+
+  const addContact = (a: number, b: number) => {
+    if (a <= 0 || b <= 0 || a === b) return
+    const lo = Math.min(a, b)
+    const hi = Math.max(a, b)
+    const key = `${lo}:${hi}`
+    contactCounts.set(key, (contactCounts.get(key) ?? 0) + 1)
+  }
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x
+      const label = labels[idx]
+      if (x < width - 1) addContact(label, labels[idx + 1])
+      if (y < height - 1) addContact(label, labels[idx + width])
+    }
+  }
+
+  for (const [key, contact] of contactCounts) {
+    const [a, b] = key.split(':').map(Number)
+    if (contact >= minContact && areas[a] > 0 && areas[b] > 0) {
+      union(parent, a, b)
+    }
+  }
+
+  const rootToLabel = new Map<number, number>()
+  const out = new Int32Array(labels.length)
+  let nextLabel = 1
+
+  for (let idx = 0; idx < labels.length; idx++) {
+    const label = labels[idx]
+    if (label <= 0) {
+      out[idx] = label
+      continue
+    }
+
+    const root = find(parent, label)
+    let compact = rootToLabel.get(root)
+    if (!compact) {
+      compact = nextLabel++
+      rootToLabel.set(root, compact)
+    }
+    out[idx] = compact
+  }
+
+  const mergedCount = numSeeds - rootToLabel.size
+  if (mergedCount > 0) {
+    console.log(
+      `[walkaround/cv] Merged ${mergedCount} long open-space watershed splits ` +
+      `(contact>=${minContact}px)`,
+    )
+  }
+
+  return { labels: out, numLabels: rootToLabel.size }
+}
+
+function find(parent: number[], x: number): number {
+  let current = x
+  while (parent[current] !== current) {
+    parent[current] = parent[parent[current]]
+    current = parent[current]
+  }
+  return current
+}
+
+function union(parent: number[], a: number, b: number): void {
+  const rootA = find(parent, a)
+  const rootB = find(parent, b)
+  if (rootA !== rootB) parent[rootB] = rootA
+}
 
 interface RegionStatsExt extends RegionStats {
   touchesBorder: boolean

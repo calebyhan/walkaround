@@ -1,9 +1,10 @@
 import { Fragment, useState, useRef, useCallback, useMemo, useEffect } from 'react'
-import { Stage, Layer, Line, Text } from 'react-konva'
+import { Stage, Layer, Line, Text, Image as KonvaImage } from 'react-konva'
 import type Konva from 'konva'
 import type { KonvaEventObject } from 'konva/lib/Node'
 import { useStore } from '@/store'
 import type { Point } from '@/lib/schema'
+import { getSourceImageOverlay, type SourceImageOverlayAnnotation } from '@/lib/sourceImageOverlay'
 
 const SCALE_BY = 1.05
 
@@ -17,6 +18,11 @@ export function EditorCanvasKonva() {
   const stageRef = useRef<Konva.Stage>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [stageSize, setStageSize] = useState<StageSize>({ width: 0, height: 0 })
+  const sourceOverlay = useMemo(
+    () => getSourceImageOverlay(floorPlan?.annotations),
+    [floorPlan?.annotations],
+  )
+  const sourceImage = useLoadedImage(sourceOverlay)
 
   useEffect(() => {
     const measure = () => {
@@ -113,7 +119,16 @@ export function EditorCanvasKonva() {
         onWheel={handleWheel}
       >
         <Layer>
-          {floorPlan?.rooms.map((room) => {
+          {floorPlan && sourceOverlay && sourceImage && (
+            <SourceImageLayer
+              overlay={sourceOverlay}
+              image={sourceImage}
+              bounds={floorPlan.meta.bounds}
+              toCanvas={toCanvas}
+            />
+          )}
+
+          {!sourceOverlay && floorPlan?.rooms.map((room) => {
             const points = room.vertices.flatMap((point) => toCanvas(point))
             const labelPoint = room.vertices[0]
             const [labelX, labelY] = toCanvas(labelPoint)
@@ -165,4 +180,54 @@ export function EditorCanvasKonva() {
       </Stage>
     </div>
   )
+}
+
+function SourceImageLayer({
+  overlay,
+  image,
+  bounds,
+  toCanvas,
+}: {
+  overlay: SourceImageOverlayAnnotation
+  image: HTMLImageElement
+  bounds: { width: number; height: number }
+  toCanvas: (point: Point) => [number, number]
+}) {
+  const [left, top] = toCanvas({ x: 0, y: bounds.height })
+  const [right, bottom] = toCanvas({ x: bounds.width, y: 0 })
+
+  return (
+    <KonvaImage
+      image={image}
+      x={left}
+      y={top}
+      width={right - left}
+      height={bottom - top}
+      crop={{
+        x: overlay.crop.x0,
+        y: overlay.crop.y0,
+        width: overlay.crop.x1 - overlay.crop.x0,
+        height: overlay.crop.y1 - overlay.crop.y0,
+      }}
+      opacity={0.72}
+    />
+  )
+}
+
+function useLoadedImage(overlay: SourceImageOverlayAnnotation | null): HTMLImageElement | null {
+  const [loaded, setLoaded] = useState<{
+    overlay: SourceImageOverlayAnnotation
+    image: HTMLImageElement | null
+  } | null>(null)
+
+  useEffect(() => {
+    if (!overlay) return
+
+    const img = new Image()
+    img.onload = () => setLoaded({ overlay, image: img })
+    img.onerror = () => setLoaded({ overlay, image: null })
+    img.src = `data:${overlay.mimeType};base64,${overlay.data}`
+  }, [overlay])
+
+  return overlay && loaded?.overlay === overlay ? loaded.image : null
 }

@@ -26,9 +26,12 @@ export async function analyseFloorPlan(
   mimeType: 'image/jpeg' | 'image/png' | 'application/pdf',
   sourceFilename: string,
 ): Promise<FloorPlanSchema> {
+  let cvFallbackContext: Awaited<ReturnType<typeof runCVPipeline>> | null = null
+
   if (mimeType !== 'application/pdf') {
     try {
       const cvResult = await runCVPipeline(imageBase64, mimeType)
+      cvFallbackContext = cvResult
       if (cvResult.regions.length >= 3) {
         console.log(`[walkaround] CV path: ${cvResult.regions.length} regions detected`)
         const schema = await analyseWithCV(imageBase64, mimeType, cvResult)
@@ -48,7 +51,7 @@ export async function analyseFloorPlan(
   }
 
   console.log('[walkaround] LLM-only path')
-  const schema = await analyseFloorPlanLLMOnly(imageBase64, mimeType)
+  const schema = await analyseFloorPlanLLMOnly(imageBase64, mimeType, cvFallbackContext)
   schema.meta.source_image = sourceFilename
   return schema
 }
@@ -84,6 +87,15 @@ async function analyseWithCV(
   )
 
   const draft = mergeWithLLMLabels(cvResult, llmOutput)
+  if (draft.sourceImageCrop) {
+    draft.sourceImage = {
+      base64: imageBase64,
+      mimeType,
+      imageWidth: cvResult.imageWidth,
+      imageHeight: cvResult.imageHeight,
+      crop: draft.sourceImageCrop,
+    }
+  }
   return convertDraftToSchema(draft)
 }
 
@@ -94,6 +106,7 @@ async function analyseWithCV(
 async function analyseFloorPlanLLMOnly(
   imageBase64: string,
   mimeType: 'image/jpeg' | 'image/png' | 'application/pdf',
+  cvFallbackContext?: Awaited<ReturnType<typeof runCVPipeline>> | null,
 ): Promise<FloorPlanSchema> {
   const prompt = buildLLMOnlyPrompt()
 
@@ -109,6 +122,14 @@ async function analyseFloorPlanLLMOnly(
   )
 
   const draft = parseLayoutDraftFromRaw(rawText)
+  if (cvFallbackContext) {
+    draft.wallMask = {
+      mask: cvFallbackContext.wallMask,
+      width: cvFallbackContext.wallMaskWidth,
+      height: cvFallbackContext.wallMaskHeight,
+      sampleRadiusPx: cvFallbackContext.wallSampleRadiusPx,
+    }
+  }
   console.log(
     '[walkaround] Draft rooms:',
     draft.rooms.map((r) => ({ id: r.id, name: r.name, bbox: r.image_bbox })),

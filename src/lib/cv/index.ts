@@ -1,4 +1,12 @@
-import { base64ToImageData, downsample, toGrayscale, threshold } from './preprocess'
+import {
+  base64ToImageData,
+  countWallPixels,
+  downsample,
+  erodeWhiteFast,
+  threshold,
+  thresholdGrayWalls,
+  toGrayscale,
+} from './preprocess'
 import { detectRegions } from './regionDetect'
 import { drawLabeledOverlay } from './labelOverlay'
 import { CVUnsupportedError } from './types'
@@ -32,10 +40,20 @@ export async function runCVPipeline(
   )
 
   const gray = toGrayscale(dsData)
-  const mask = threshold(gray)
+  const darkMask = threshold(gray)
+  const grayWallMask = thresholdGrayWalls(gray)
+  const grayWallCoverage = countWallPixels(grayWallMask) / grayWallMask.length
+  const mask = grayWallCoverage >= 0.005 ? grayWallMask : darkMask
+  console.log(
+    `[walkaround/cv] Wall mask: ${grayWallCoverage >= 0.005 ? 'gray structural' : 'dark fallback'} ` +
+    `(gray coverage=${(grayWallCoverage * 100).toFixed(1)}%)`,
+  )
+  const wallCloseRadius = Math.max(1, Math.round(Math.min(dsW, dsH) * 0.002))
+  const closedMask = erodeWhiteFast(mask, dsW, dsH, wallCloseRadius)
+  console.log(`[walkaround/cv] Closed small wall gaps with radius=${wallCloseRadius}px`)
 
   console.log('[walkaround/cv] Running BFS flood-fill region detection…')
-  const rawRegions = detectRegions(mask, dsW, dsH)
+  const rawRegions = detectRegions(closedMask, dsW, dsH)
 
   // Scale bboxes, centroids, and polygons back to original image coordinates
   const regions: CVRegion[] = rawRegions.map((r) => ({
@@ -70,5 +88,9 @@ export async function runCVPipeline(
     imageWidth: original.width,
     imageHeight: original.height,
     downsampleScale: scale,
+    wallMask: mask,
+    wallMaskWidth: dsW,
+    wallMaskHeight: dsH,
+    wallSampleRadiusPx: Math.max(3, wallCloseRadius * 2),
   }
 }

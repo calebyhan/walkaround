@@ -1,78 +1,66 @@
-// 3D scene: each room rendered as an independent box (floor + 4 walls).
-// Rooms from adjacent areas will produce double-walls at shared edges,
-// which is visually acceptable and avoids the fragility of adjacency detection.
-import { useEffect } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useThree } from '@react-three/fiber'
+import * as THREE from 'three'
 import { useStore } from '@/store'
 import { CameraController } from './CameraController'
+import {
+  buildRoomFloorGeometry,
+  buildWallCollisionAabbs,
+  buildWallRenderBoxes,
+  type WallRenderBox,
+} from '@/lib/geometry/rendering'
 import type { Room } from '@/lib/schema'
+import { getSourceImageOverlay, type SourceImageOverlayAnnotation } from '@/lib/sourceImageOverlay'
 
-// Schema coords: origin bottom-left, +X right, +Y up (depth).
-// Three.js floor plane is XZ. rotation=[+PI/2, 0, 0] maps schema Y → Three.js +Z.
-
-
-interface RoomBoxProps {
+interface FloorMeshProps {
   room: Room
-  boundsWidth: number
-  boundsHeight: number
 }
 
-function RoomBox({ room, boundsWidth, boundsHeight }: RoomBoxProps) {
-  // Filter rooms with obviously garbage coordinates (3m tolerance for balconies/overhangs)
-  const margin = 3
-  const inBounds = room.vertices.every(
-    (v) => v.x >= -margin && v.x <= boundsWidth + margin && v.y >= -margin && v.y <= boundsHeight + margin
+function FloorMesh({ room }: FloorMeshProps) {
+  const geometry = useMemo(
+    () => (room.vertices.length >= 3 ? buildRoomFloorGeometry(room) : null),
+    [room],
   )
-  if (!inBounds) return null
 
-  const xs = room.vertices.map((v) => v.x)
-  const ys = room.vertices.map((v) => v.y)
-  const xMin = Math.min(...xs)
-  const xMax = Math.max(...xs)
-  const yMin = Math.min(...ys)
-  const yMax = Math.max(...ys)
+  useEffect(() => () => geometry?.dispose(), [geometry])
 
-  const w = xMax - xMin
-  const d = yMax - yMin
-  if (w < 0.1 || d < 0.1) return null
-
-  const h = room.ceiling_height > 0 ? room.ceiling_height : 2.7
-  const t = 0.15 // wall thickness
-  const isExteriorCandidate = true // color hinting — all rooms treated the same for now
-  const color = isExteriorCandidate ? '#8a8a9a' : '#6a6a7a'
-
-  // Group centered at room center; schema Y maps to Three.js +Z
-  const cx = xMin + w / 2
-  const cz = yMin + d / 2
+  if (!geometry) return null
 
   return (
-    <group position={[cx, 0, cz]}>
-      {/* Floor: local coords centered at room center, +PI/2 maps local Y → Three.js +Z */}
-      <mesh rotation={[Math.PI / 2, 0, 0]} receiveShadow>
-        <planeGeometry args={[w, d]} />
-        <meshStandardMaterial color="#4a4a52" />
-      </mesh>
-      {/* North wall (+Z face) */}
-      <mesh position={[0, h / 2, d / 2]} castShadow receiveShadow>
-        <boxGeometry args={[w + t, h, t]} />
-        <meshStandardMaterial color={color} />
-      </mesh>
-      {/* South wall (-Z face) */}
-      <mesh position={[0, h / 2, -d / 2]} castShadow receiveShadow>
-        <boxGeometry args={[w + t, h, t]} />
-        <meshStandardMaterial color={color} />
-      </mesh>
-      {/* East wall (+X face) */}
-      <mesh position={[w / 2, h / 2, 0]} castShadow receiveShadow>
-        <boxGeometry args={[t, h, d + t]} />
-        <meshStandardMaterial color={color} />
-      </mesh>
-      {/* West wall (-X face) */}
-      <mesh position={[-w / 2, h / 2, 0]} castShadow receiveShadow>
-        <boxGeometry args={[t, h, d + t]} />
-        <meshStandardMaterial color={color} />
-      </mesh>
-    </group>
+    <mesh geometry={geometry} receiveShadow>
+      <meshStandardMaterial color={floorColor(room.floor_material)} side={THREE.DoubleSide} />
+    </mesh>
+  )
+}
+
+interface WallBoxMeshProps {
+  box: WallRenderBox
+}
+
+function WallBoxMesh({ box }: WallBoxMeshProps) {
+  return (
+    <mesh position={box.position} rotation={[0, box.rotationY, 0]} castShadow receiveShadow>
+      <boxGeometry args={box.size} />
+      <meshStandardMaterial color={box.isExterior ? '#8a8a9a' : '#747484'} />
+    </mesh>
+  )
+}
+
+function SourceFloorPlanMesh({
+  overlay,
+  bounds,
+}: {
+  overlay: SourceImageOverlayAnnotation
+  bounds: { width: number; height: number }
+}) {
+  const texture = useSourceImageTexture(overlay)
+  if (!texture) return null
+
+  return (
+    <mesh position={[bounds.width / 2, 0.004, bounds.height / 2]} rotation={[Math.PI / 2, 0, 0]} receiveShadow>
+      <planeGeometry args={[bounds.width, bounds.height]} />
+      <meshBasicMaterial map={texture} side={THREE.DoubleSide} transparent opacity={0.86} />
+    </mesh>
   )
 }
 
@@ -86,14 +74,13 @@ function CameraAutoCenter() {
     const cx = width / 2
     const cz = height / 2
     const dist = Math.max(width, height) * 0.9
-    // Camera on the north side (negative Z) looking toward +Z
+
     camera.position.set(cx, dist, cz - dist)
     camera.lookAt(cx, 0, cz)
     if (controls) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const orbit = controls as any
-      orbit.target.set(cx, 0, cz)
-      orbit.update()
+      const orbit = controls as { target?: THREE.Vector3; update?: () => void }
+      orbit.target?.set(cx, 0, cz)
+      orbit.update?.()
     }
   }, [camera, controls, floorPlan])
 
@@ -104,31 +91,19 @@ export function ViewerScene() {
   const floorPlan = useStore((s) => s.floorPlan)
   const cameraMode = useStore((s) => s.cameraMode)
   const setCameraMode = useStore((s) => s.setCameraMode)
+  const sourceOverlay = useMemo(
+    () => getSourceImageOverlay(floorPlan?.annotations),
+    [floorPlan?.annotations],
+  )
 
-  const boundsWidth = floorPlan?.meta.bounds.width ?? 20
-  const boundsHeight = floorPlan?.meta.bounds.height ?? 20
-
-  // Compute wall AABBs from room bboxes for first-person collision detection
-  const wallAabbs = (floorPlan?.rooms ?? []).flatMap((room) => {
-    const xs = room.vertices.map((v) => v.x)
-    const ys = room.vertices.map((v) => v.y)
-    const xMin = Math.min(...xs)
-    const xMax = Math.max(...xs)
-    const yMin = Math.min(...ys)
-    const yMax = Math.max(...ys)
-    const t = 0.15
-    // Return 4 AABBs (one per wall face) for collision
-    return [
-      // North wall
-      { minX: xMin, maxX: xMax, minZ: yMax - t / 2, maxZ: yMax + t / 2 },
-      // South wall
-      { minX: xMin, maxX: xMax, minZ: yMin - t / 2, maxZ: yMin + t / 2 },
-      // East wall
-      { minX: xMax - t / 2, maxX: xMax + t / 2, minZ: yMin, maxZ: yMax },
-      // West wall
-      { minX: xMin - t / 2, maxX: xMin + t / 2, minZ: yMin, maxZ: yMax },
-    ]
-  })
+  const wallBoxes = useMemo(
+    () => buildWallRenderBoxes(floorPlan?.walls ?? []),
+    [floorPlan?.walls],
+  )
+  const wallAabbs = useMemo(
+    () => buildWallCollisionAabbs(floorPlan?.walls ?? []),
+    [floorPlan?.walls],
+  )
 
   return (
     <>
@@ -145,16 +120,93 @@ export function ViewerScene() {
         onExitFirstPerson={() => setCameraMode('orbit')}
       />
 
-      {floorPlan?.rooms.map((room) => (
-        <RoomBox
-          key={room.id}
-          room={room}
-          boundsWidth={boundsWidth}
-          boundsHeight={boundsHeight}
-        />
+      {floorPlan && sourceOverlay ? (
+        <SourceFloorPlanMesh overlay={sourceOverlay} bounds={floorPlan.meta.bounds} />
+      ) : (
+        floorPlan?.rooms.map((room) => (
+          <FloorMesh key={room.id} room={room} />
+        ))
+      )}
+
+      {wallBoxes.map((box) => (
+        <WallBoxMesh key={box.id} box={box} />
       ))}
 
       {!floorPlan && <gridHelper args={[20, 20, '#3f3f46', '#27272a']} />}
     </>
   )
+}
+
+function useSourceImageTexture(overlay: SourceImageOverlayAnnotation): THREE.Texture | null {
+  const [texture, setTexture] = useState<THREE.Texture | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const img = new Image()
+
+    img.onload = () => {
+      if (cancelled) return
+      const cropW = Math.max(1, Math.round(overlay.crop.x1 - overlay.crop.x0))
+      const cropH = Math.max(1, Math.round(overlay.crop.y1 - overlay.crop.y0))
+      const canvas = document.createElement('canvas')
+      canvas.width = cropW
+      canvas.height = cropH
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+
+      ctx.drawImage(
+        img,
+        overlay.crop.x0,
+        overlay.crop.y0,
+        cropW,
+        cropH,
+        0,
+        0,
+        cropW,
+        cropH,
+      )
+
+      const nextTexture = new THREE.CanvasTexture(canvas)
+      nextTexture.colorSpace = THREE.SRGBColorSpace
+      // The floor plane is viewed from the back side after mapping image Y to plan Z;
+      // counter-flip X so source text/rooms match the 2D plan instead of mirroring.
+      nextTexture.wrapS = THREE.ClampToEdgeWrapping
+      nextTexture.offset.x = 1
+      nextTexture.repeat.x = -1
+      nextTexture.needsUpdate = true
+      setTexture((previous) => {
+        previous?.dispose()
+        return nextTexture
+      })
+    }
+    img.onerror = () => {
+      if (!cancelled) setTexture(null)
+    }
+    img.src = `data:${overlay.mimeType};base64,${overlay.data}`
+
+    return () => {
+      cancelled = true
+      setTexture((previous) => {
+        previous?.dispose()
+        return null
+      })
+    }
+  }, [overlay])
+
+  return texture
+}
+
+function floorColor(material: string): string {
+  switch (material) {
+    case 'hardwood':
+      return '#8b5a2b'
+    case 'tile':
+      return '#8c9198'
+    case 'carpet':
+      return '#58626f'
+    case 'concrete':
+      return '#6b7280'
+    default:
+      return '#4a4a52'
+  }
 }

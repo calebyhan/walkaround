@@ -25,23 +25,27 @@ DIMENSION CONVERSION (apply before returning):
 - 1 foot = 0.3048 m, 1 inch = 0.0254 m
 - "12'0" = 3.658 m, "18'2" = 5.537 m, "10'6" = 3.200 m, "8'4" = 2.540 m
 - "7'4" = 2.235 m, "13'0" = 3.962 m, "11'0" = 3.353 m, "15'0" = 4.572 m, "10'3" = 3.124 m
+- 1 square foot = 0.09290304 m². Example: "1000 square feet" = 92.903 m²
 
 RULES:
 - Every numbered region must appear in the output, even if unlabeled (use generic names like "Room 1")
+- If multiple numbered regions are fragments of the same labeled room or open area, give them the exact same room name. Do not invent names like "Alcove", "Extension", or "Area" unless that text is visible in the original floor plan.
 - width_m is the horizontal dimension, depth_m is the vertical dimension of the room
-- If a room has only one dimension label, use it for whichever axis fits the region's visual shape
+- If the numbered polygon is only a fragment of a labeled room, set width_m and depth_m to 0 for that fragment unless the visible dimensions clearly describe that exact polygon.
+- If a room has only one dimension label, use it for whichever axis fits the region's visual shape and set the unknown axis to 0.
 - confidence: "high" if explicit dimension label found, "medium" if name only, "low" if guessed
 - wall directions: "north" = top of image, "south" = bottom, "east" = right, "west" = left
 - position_along_wall: fraction [0.0, 1.0] along the wall from start to end where the opening center sits
 - Return the total floor plan name in floor_name if visible (e.g. "Ground Floor"), else use "Floor 1"
-- plan_width_m: sum the widths of all rooms along the widest horizontal row → total plan width in meters
-- plan_height_m: sum the depths of all rooms along the tallest vertical column → total plan height in meters
+- plan_width_m and plan_height_m: return numeric values ONLY if the overall plan dimensions are explicitly printed in IMAGE 1. Otherwise return null. Do not estimate or sum room dimensions for these fields.
+- total_area_m2: return the converted total area ONLY if a total square footage / square meter area is explicitly printed in IMAGE 1. Otherwise return null.
 
 SCHEMA:
 {
   "floor_name": "Ground Floor",
-  "plan_width_m": 10.5,
-  "plan_height_m": 8.2,
+  "plan_width_m": null,
+  "plan_height_m": null,
+  "total_area_m2": null,
   "rooms": [
     {
       "region_id": 1,

@@ -9,11 +9,14 @@ const modelName = (import.meta.env.VITE_GEMINI_MODEL as string | undefined) ?? '
 
 // thinkingBudget: 4096 gives the model meaningful reasoning headroom for spatial
 // floor-plan extraction without risking the timeout issues seen with unlimited thinking.
+const generationConfig = {
+  temperature: 0.1,
+  // The installed SDK accepts this at runtime but its GenerationConfig type does
+  // not expose the newer thinkingConfig field yet.
+  thinkingConfig: { thinkingBudget: 4096 },
+}
+
 export const geminiModel = genai.getGenerativeModel({
   model: modelName,
-  generationConfig: {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    thinkingConfig: { thinkingBudget: 4096 } as any,
-    temperature: 0.1,
-  },
+  generationConfig,
 })

@@ -38,6 +38,11 @@ export interface CVPipelineResult {
   imageHeight: number
   /** Factor by which the image was downsampled for CV: original_px / downsampled_px */
   downsampleScale: number
+  /** Downsampled binary structural wall mask before room-detection gap closing. 0 = wall, 1 = open. */
+  wallMask: Uint8Array
+  wallMaskWidth: number
+  wallMaskHeight: number
+  wallSampleRadiusPx: number
 }
 
 export class CVUnsupportedError extends Error {
