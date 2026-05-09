@@ -54,14 +54,52 @@ function SourceFloorPlanMesh({
   bounds: { width: number; height: number }
 }) {
   const texture = useSourceImageTexture(overlay)
+  const geometry = useMemo(
+    () => buildSourceFloorPlanGeometry(bounds.width, bounds.height),
+    [bounds.height, bounds.width],
+  )
+
+  useEffect(() => () => geometry.dispose(), [geometry])
+
   if (!texture) return null
 
   return (
-    <mesh position={[bounds.width / 2, 0.004, bounds.height / 2]} rotation={[Math.PI / 2, 0, 0]} receiveShadow>
-      <planeGeometry args={[bounds.width, bounds.height]} />
+    <mesh geometry={geometry} position={[0, 0.004, 0]} receiveShadow>
       <meshBasicMaterial map={texture} side={THREE.DoubleSide} transparent opacity={0.86} />
     </mesh>
   )
+}
+
+function buildSourceFloorPlanGeometry(width: number, height: number): THREE.BufferGeometry {
+  const geometry = new THREE.BufferGeometry()
+
+  geometry.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute(
+      [
+        0, 0, 0,
+        width, 0, 0,
+        width, 0, height,
+        0, 0, height,
+      ],
+      3,
+    ),
+  )
+  geometry.setAttribute(
+    'uv',
+    new THREE.Float32BufferAttribute(
+      [
+        1, 1,
+        0, 1,
+        0, 0,
+        1, 0,
+      ],
+      2,
+    ),
+  )
+  geometry.setIndex([0, 2, 1, 0, 3, 2])
+  geometry.computeVertexNormals()
+  return geometry
 }
 
 function CameraAutoCenter() {
@@ -168,11 +206,9 @@ function useSourceImageTexture(overlay: SourceImageOverlayAnnotation): THREE.Tex
 
       const nextTexture = new THREE.CanvasTexture(canvas)
       nextTexture.colorSpace = THREE.SRGBColorSpace
-      // The floor plane is viewed from the back side after mapping image Y to plan Z;
-      // counter-flip X so source text/rooms match the 2D plan instead of mirroring.
-      nextTexture.wrapS = THREE.ClampToEdgeWrapping
-      nextTexture.offset.x = 1
-      nextTexture.repeat.x = -1
+      // Keep image-space Y explicit in the floor geometry UVs; CanvasTexture's
+      // default upload flip would invert the underlay against the wall geometry.
+      nextTexture.flipY = false
       nextTexture.needsUpdate = true
       setTexture((previous) => {
         previous?.dispose()
