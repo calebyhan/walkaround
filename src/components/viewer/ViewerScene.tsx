@@ -7,6 +7,7 @@ import {
   buildRoomFloorGeometry,
   buildWallCollisionAabbs,
   buildWallRenderBoxes,
+  type WallAabb,
   type WallRenderBox,
 } from '@/lib/geometry/rendering'
 import type { Room } from '@/lib/schema'
@@ -44,6 +45,24 @@ function WallBoxMesh({ box }: WallBoxMeshProps) {
       <meshStandardMaterial color={box.isExterior ? '#8a8a9a' : '#747484'} />
     </mesh>
   )
+}
+
+function mirrorWallBoxX(box: WallRenderBox, boundsWidth: number): WallRenderBox {
+  const [x, y, z] = box.position
+  return {
+    ...box,
+    position: [boundsWidth - x, y, z],
+    rotationY: Math.PI - box.rotationY,
+  }
+}
+
+function mirrorWallAabbX(aabb: WallAabb, boundsWidth: number): WallAabb {
+  return {
+    minX: boundsWidth - aabb.maxX,
+    maxX: boundsWidth - aabb.minX,
+    minZ: aabb.minZ,
+    maxZ: aabb.maxZ,
+  }
 }
 
 function SourceFloorPlanMesh({
@@ -142,6 +161,14 @@ export function ViewerScene() {
     () => buildWallCollisionAabbs(floorPlan?.walls ?? []),
     [floorPlan?.walls],
   )
+  const renderWallBoxes = useMemo(() => {
+    if (!floorPlan || !sourceOverlay) return wallBoxes
+    return wallBoxes.map((box) => mirrorWallBoxX(box, floorPlan.meta.bounds.width))
+  }, [floorPlan, sourceOverlay, wallBoxes])
+  const renderWallAabbs = useMemo(() => {
+    if (!floorPlan || !sourceOverlay) return wallAabbs
+    return wallAabbs.map((aabb) => mirrorWallAabbX(aabb, floorPlan.meta.bounds.width))
+  }, [floorPlan, sourceOverlay, wallAabbs])
 
   return (
     <>
@@ -154,7 +181,7 @@ export function ViewerScene() {
 
       <CameraController
         mode={cameraMode}
-        wallAabbs={wallAabbs}
+        wallAabbs={renderWallAabbs}
         onExitFirstPerson={() => setCameraMode('orbit')}
       />
 
@@ -166,7 +193,7 @@ export function ViewerScene() {
         ))
       )}
 
-      {wallBoxes.map((box) => (
+      {renderWallBoxes.map((box) => (
         <WallBoxMesh key={box.id} box={box} />
       ))}
 
